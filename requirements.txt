@@ -1,9 +1,7 @@
 fastapi
 uvicorn
-requests
-numpy==1.26.4
-faiss-cpu==1.7.4
 python-dotenv
+requests
 beautifulsoup4
-openai
-python-multipart
+openai>=1.0.0
+numpy
