@@ -1,5 +1,8 @@
 fastapi
 uvicorn
 requests
+numpy
+faiss-cpu
 python-dotenv
 beautifulsoup4
+openai
