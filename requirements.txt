@@ -1,7 +1,7 @@
-fastapi
-uvicorn
-python-dotenv
-requests
-beautifulsoup4
-openai>=1.0.0
-numpy
+fastapi==0.116.1
+uvicorn==0.35.0
+python-dotenv==1.1.1
+beautifulsoup4==4.13.5
+requests==2.32.5
+openai==1.102.0
+python-multipart==0.0.20
