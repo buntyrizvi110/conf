@@ -1,4 +1,3 @@
-
 import os
 import re
 import logging
@@ -10,41 +9,25 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, Form
 from fastapi.responses import HTMLResponse
 from openai import OpenAI
+from threading import Thread
 
 # =========================================================
 # CONFIG
 # =========================================================
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(message)s"
-)
-
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("confluence-rag")
 
 load_dotenv()
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-
 CONFLUENCE_BASE_URL = os.getenv("CONFLUENCE_BASE_URL")
 CONFLUENCE_USERNAME = os.getenv("CONFLUENCE_USERNAME")
 CONFLUENCE_API_TOKEN = os.getenv("CONFLUENCE_API_TOKEN")
 
-if not OPENAI_API_KEY:
-    raise Exception("OPENAI_API_KEY missing")
-
-if not CONFLUENCE_BASE_URL:
-    raise Exception("CONFLUENCE_BASE_URL missing")
-
-if not CONFLUENCE_USERNAME:
-    raise Exception("CONFLUENCE_USERNAME missing")
-
-if not CONFLUENCE_API_TOKEN:
-    raise Exception("CONFLUENCE_API_TOKEN missing")
-
 client = OpenAI(api_key=OPENAI_API_KEY)
 
-app = FastAPI(title="Enterprise Confluence RAG")
+app = FastAPI(title="Confluence RAG")
 
 # =========================================================
 # SETTINGS
@@ -52,147 +35,93 @@ app = FastAPI(title="Enterprise Confluence RAG")
 
 CHUNK_SIZE = 300
 CHUNK_OVERLAP = 80
-
-TOP_K = 10
+TOP_K = 8
 
 EMBEDDING_MODEL = "text-embedding-3-small"
-
 GPT_MODEL = "gpt-4.1-mini"
 
-STOPWORDS = {
-    "the", "is", "was", "when", "where", "how",
-    "a", "an", "of", "to", "in", "on", "for",
-    "and", "or", "with", "by", "at", "from",
-    "that", "this", "are", "were"
-}
-
 # =========================================================
-# MEMORY STORE
+# MEMORY
 # =========================================================
 
 documents = []
+
+job_state = {
+    "running": False,
+    "progress": 0,
+    "message": "Idle"
+}
 
 # =========================================================
 # HELPERS
 # =========================================================
 
-def clean_html(html: str) -> str:
-
+def clean_html(html: str):
     soup = BeautifulSoup(html, "html.parser")
-
     text = soup.get_text(" ")
-
-    text = re.sub(r"\s+", " ", text)
-
-    return text.strip()
+    return re.sub(r"\s+", " ", text).strip()
 
 
-def tokenize(text: str):
-
-    words = re.findall(r"\w+", text.lower())
-
-    return [
-        w for w in words
-        if w not in STOPWORDS and len(w) > 2
-    ]
-
-
-def chunk_text(
-    text: str,
-    size: int = CHUNK_SIZE,
-    overlap: int = CHUNK_OVERLAP
-):
-
+def chunk_text(text: str):
     words = text.split()
-
     chunks = []
-
     start = 0
 
     while start < len(words):
-
-        end = start + size
-
-        chunk = " ".join(words[start:end])
-
-        if len(chunk.strip()) > 100:
-            chunks.append(chunk)
-
-        start += size - overlap
+        end = start + CHUNK_SIZE
+        chunks.append(" ".join(words[start:end]))
+        start += CHUNK_SIZE - CHUNK_OVERLAP
 
     return chunks
 
 
-def cosine_similarity(a, b):
-
-    a = np.array(a)
-    b = np.array(b)
-
-    denominator = (
-        np.linalg.norm(a) *
-        np.linalg.norm(b)
-    )
-
-    if denominator == 0:
-        return 0
-
-    return np.dot(a, b) / denominator
-
-
-def create_embedding(text: str):
-
-    response = client.embeddings.create(
+def embed(text: str):
+    res = client.embeddings.create(
         model=EMBEDDING_MODEL,
         input=text[:8000]
     )
+    return res.data[0].embedding
 
-    return response.data[0].embedding
+
+def cosine(a, b):
+    a = np.array(a)
+    b = np.array(b)
+    return np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b) + 1e-9)
 
 # =========================================================
-# CONFLUENCE INDEXER
+# INDEXING
 # =========================================================
 
 def fetch_confluence_pages():
 
-    global documents
+    global documents, job_state
 
-    logger.info("Refreshing Confluence index...")
-
-    new_documents = []
-
+    new_docs = []
     start = 0
     limit = 50
+    processed = 0
+
+    job_state["running"] = True
+    job_state["progress"] = 1
+    job_state["message"] = "Indexing..."
 
     while True:
 
         url = (
-            f"{CONFLUENCE_BASE_URL}"
-            f"/rest/api/content"
-            f"?expand=body.storage"
-            f"&limit={limit}"
-            f"&start={start}"
+            f"{CONFLUENCE_BASE_URL}/rest/api/content"
+            f"?expand=body.storage&limit={limit}&start={start}"
         )
 
-        response = requests.get(
+        r = requests.get(
             url,
-            auth=(
-                CONFLUENCE_USERNAME,
-                CONFLUENCE_API_TOKEN
-            ),
+            auth=(CONFLUENCE_USERNAME, CONFLUENCE_API_TOKEN),
             timeout=60
         )
 
-        if response.status_code != 200:
-
-            logger.error(
-                f"Confluence fetch failed: "
-                f"{response.status_code}"
-            )
-
+        if r.status_code != 200:
             break
 
-        data = response.json()
-
+        data = r.json()
         results = data.get("results", [])
 
         if not results:
@@ -201,194 +130,112 @@ def fetch_confluence_pages():
         for page in results:
 
             try:
-
-                title = page.get(
-                    "title",
-                    "Untitled"
-                )
-
-                html = (
-                    page["body"]["storage"]["value"]
-                )
-
+                title = page.get("title", "Untitled")
+                html = page["body"]["storage"]["value"]
                 text = clean_html(html)
 
                 if len(text) < 50:
                     continue
 
-                relative_url = (
-                    page.get("_links", {})
-                    .get("webui", "")
-                )
-
-                page_url = (
-                    f"{CONFLUENCE_BASE_URL}"
-                    f"{relative_url}"
-                )
-
+                page_url = f"{CONFLUENCE_BASE_URL}{page.get('_links', {}).get('webui','')}"
                 chunks = chunk_text(text)
 
-                logger.info(
-                    f"Indexing: {title}"
-                )
-
-                for chunk in chunks:
-
-                    embedding = create_embedding(chunk)
-
-                    new_documents.append({
-
+                for c in chunks:
+                    emb = embed(c)
+                    new_docs.append({
                         "title": title,
-
-                        "text": chunk,
-
+                        "text": c,
                         "url": page_url,
-
-                        "embedding": embedding
+                        "embedding": emb
                     })
 
-            except Exception as e:
+                processed += 1
+                job_state["progress"] = min(int(processed * 2), 99)
+                job_state["message"] = f"Processing {title}"
 
-                logger.error(
-                    f"Page processing failed: {e}"
-                )
+            except Exception as e:
+                logger.error(e)
 
         start += limit
 
-    documents = new_documents
+    documents = new_docs
 
-    logger.info(
-        f"Loaded {len(documents)} chunks"
-    )
+    job_state["progress"] = 100
+    job_state["running"] = False
+    job_state["message"] = "Completed"
+
+# =========================================================
+# BACKGROUND
+# =========================================================
+
+def run_refresh():
+    try:
+        fetch_confluence_pages()
+    except Exception as e:
+        logger.error(e)
+        job_state["running"] = False
 
 # =========================================================
 # SEARCH
 # =========================================================
 
-def semantic_search(query: str):
+def search(query: str):
 
     if not documents:
         return []
 
-    query_embedding = create_embedding(query)
+    q_emb = embed(query)
 
-    query_words = tokenize(query)
+    scored = []
 
-    scored_results = []
+    for d in documents:
+        score = cosine(q_emb, d["embedding"])
+        scored.append((score, d))
 
-    for doc in documents:
-
-        similarity = cosine_similarity(
-            query_embedding,
-            doc["embedding"]
-        )
-
-        keyword_bonus = 0
-
-        title = doc["title"].lower()
-
-        text = doc["text"].lower()
-
-        for word in query_words:
-
-            if word in title:
-                keyword_bonus += 0.40
-
-            if word in text:
-                keyword_bonus += 0.20
-
-        if query.lower() in text:
-            keyword_bonus += 1.5
-
-        final_score = (
-            similarity +
-            keyword_bonus
-        )
-
-        scored_results.append(
-            (final_score, doc)
-        )
-
-    scored_results.sort(
-        reverse=True,
-        key=lambda x: x[0]
-    )
-
-    return scored_results[:TOP_K]
+    scored.sort(reverse=True, key=lambda x: x[0])
+    return scored[:TOP_K]
 
 # =========================================================
-# GPT ANSWER
+# GPT (ONLY ONE BEST REFERENCE LINK)
 # =========================================================
 
-def generate_answer(query: str, results):
+def answer(query, results):
 
-    context = "\n\n".join([
+    if not results:
+        return "No data found", None
 
-        f"""
-        TITLE:
-        {doc['title']}
+    best = results[0][1]
 
-        CONTENT:
-        {doc['text']}
-        """
+    context = f"{best['title']}\n{best['text']}"
 
-        for score, doc in results
-    ])
-
-    prompt = f"""
-You are an enterprise Confluence assistant.
-
-Answer ONLY using the provided context.
-
-Rules:
-
-- Give direct answers
-- Combine facts if needed
-- Do not hallucinate
-- If answer unavailable say:
-  "Information not found in Confluence."
-
-QUESTION:
-{query}
-
-CONTEXT:
-{context}
-"""
-
-    response = client.chat.completions.create(
-
+    res = client.chat.completions.create(
         model=GPT_MODEL,
-
-        temperature=0.1,
-
         messages=[
-
-            {
-                "role": "system",
-                "content":
-                "You answer using enterprise knowledge."
-            },
-
-            {
-                "role": "user",
-                "content": prompt
-            }
+            {"role": "system", "content": "Answer strictly from context."},
+            {"role": "user", "content": f"Q: {query}\n\nContext:\n{context}"}
         ]
     )
 
-    return response.choices[0].message.content
+    return res.choices[0].message.content, best["url"]
 
 # =========================================================
-# HTML UI
+# UI (FIXED EXACTLY AS REQUESTED)
 # =========================================================
 
-def render(content=""):
+def render(content="", link=None):
+
+    link_html = ""
+    if link:
+        link_html = f"""
+        <div style="margin-top:20px;">
+            <b>Reference:</b>
+            <a href="{link}" target="_blank">Open Most Relevant Page</a>
+        </div>
+        """
 
     return f"""
     <html>
-
     <head>
-
         <title>Confluence RAG</title>
 
         <style>
@@ -397,6 +244,34 @@ def render(content=""):
                 font-family: Arial;
                 margin: 40px;
                 background: #f5f5f5;
+            }}
+
+            /* =========================
+               🔴 RED PROGRESS LINE ONLY
+            ========================= */
+            #progress-bar {{
+                position: fixed;
+                top: 0;
+                left: 0;
+                height: 6px;
+                width: 0%;
+                background: red;
+                z-index: 9999;
+                transition: width 0.3s ease;
+            }}
+
+            /* =========================
+               🔴 RED BANNER HEADER
+            ========================= */
+            .banner {{
+                background: red;
+                color: white;
+                padding: 15px;
+                font-size: 20px;
+                font-weight: bold;
+                text-align: center;
+                border-radius: 6px;
+                margin-bottom: 20px;
             }}
 
             input {{
@@ -417,8 +292,9 @@ def render(content=""):
                 font-size: 15px;
             }}
 
+            /* NAVY BLUE BUTTON */
             .refresh-btn {{
-                background: #111;
+                background: #001f4d;
                 margin-left: 10px;
             }}
 
@@ -428,17 +304,6 @@ def render(content=""):
                 margin-top: 20px;
                 border-radius: 8px;
                 border: 1px solid #ddd;
-            }}
-
-            .source {{
-                margin-top: 20px;
-                border-top: 1px solid #ddd;
-                padding-top: 15px;
-            }}
-
-            a {{
-                color: blue;
-                text-decoration: none;
             }}
 
             .footer {{
@@ -453,61 +318,69 @@ def render(content=""):
             }}
 
         </style>
-
     </head>
 
     <body>
 
-        <h2>
+        <div id="progress-bar"></div>
+
+        <!-- 🔴 FULL RED BANNER RESTORED -->
+        <div class="banner">
             Emirates Group Confluence Search ( OpenAI RAG Solution )
-        </h2>
+        </div>
 
         <div style="display:flex; align-items:center;">
 
             <form method="post" action="/ask">
-
-                <input
-                    name="query"
-                    placeholder="Ask Confluence..."
-                    required
-                />
-
-                <button class="btn">
-                    ASK Confluence
-                </button>
-
+                <input name="query" placeholder="Ask Confluence..." required />
+                <button class="btn">ASK</button>
             </form>
 
-            <form method="post" action="/refresh">
-
-                <button
-                    class="btn refresh-btn"
-                    type="submit"
-                >
-                    Refresh Confluence
-                </button>
-
+            <form onsubmit="event.preventDefault(); startRefresh();">
+                <button class="btn refresh-btn">Refresh Confluence</button>
             </form>
 
         </div>
 
         <div class="box">
-
             {content}
-
+            {link_html}
         </div>
 
         <div class="footer">
-
-            POC Project By :
-            Syed Abbas Rizvi,
-            STE,
-            Skywards Emirates Airlines
-
+            POC Project By Syed Abbas Rizvi
         </div>
 
-    </body>
+<script>
 
+const bar = document.getElementById("progress-bar");
+
+async function startRefresh() {{
+
+    await fetch("/refresh", {{ method: "POST" }});
+
+    const interval = setInterval(async () => {{
+
+        const res = await fetch("/status");
+        const data = await res.json();
+
+        bar.style.width = data.progress + "%";
+
+        if (!data.running) {{
+            clearInterval(interval);
+            bar.style.width = "100%";
+
+            setTimeout(() => {{
+                bar.style.width = "0%";
+            }}, 800);
+        }}
+
+    }}, 800);
+}}
+
+</script>
+
+    </body>
     </html>
     """
 
@@ -517,166 +390,27 @@ def render(content=""):
 
 @app.get("/", response_class=HTMLResponse)
 def home():
-
     return render()
 
 
-@app.on_event("startup")
-def startup():
-
-    logger.info("Starting system...")
-
-    fetch_confluence_pages()
-
-    logger.info("System ready")
+@app.post("/refresh")
+def refresh():
+    if not job_state["running"]:
+        Thread(target=run_refresh, daemon=True).start()
+    return {"status": "started"}
 
 
-@app.post("/refresh", response_class=HTMLResponse)
-def refresh_confluence():
-
-    try:
-
-        logger.info(
-            "Manual refresh started..."
-        )
-
-        fetch_confluence_pages()
-
-        logger.info(
-            "Manual refresh completed"
-        )
-
-        return render(
-            """
-            <h3>Success</h3>
-
-            <div style="margin-top:15px;">
-                Confluence refreshed successfully.
-            </div>
-            """
-        )
-
-    except Exception as e:
-
-        logger.error(
-            f"Refresh failed: {e}"
-        )
-
-        return render(
-            """
-            <h3>Error</h3>
-
-            <div style="margin-top:15px;">
-                Refresh failed.
-            </div>
-            """
-        )
+@app.get("/status")
+def status():
+    return job_state
 
 
 @app.post("/ask", response_class=HTMLResponse)
 def ask(query: str = Form(...)):
 
-    try:
+    results = search(query)
 
-        results = semantic_search(query)
+    if not results:
+        return render("No results found")
 
-        if not results:
-
-            return render(
-                """
-                <h3>Answer</h3>
-
-                <div style="margin-top:15px;">
-                    Information not found in Confluence.
-                </div>
-                """
-            )
-
-        answer = generate_answer(
-            query,
-            results
-        )
-
-        # =====================================================
-        # IF GPT SAYS INFORMATION NOT FOUND
-        # DO NOT SHOW SOURCES
-        # =====================================================
-
-        if "Information not found in Confluence" in answer:
-
-            html = f"""
-
-            <h3>Answer</h3>
-
-            <div style="margin-top:15px;">
-                {answer}
-            </div>
-
-            """
-
-            return render(html)
-
-        # =====================================================
-        # SHOW SOURCES ONLY WHEN VALID ANSWER EXISTS
-        # =====================================================
-
-        seen = set()
-
-        sources_html = ""
-
-        for score, doc in results:
-
-            if doc["url"] in seen:
-                continue
-
-            seen.add(doc["url"])
-
-            sources_html += f"""
-
-            <div class="source">
-
-                <b>{doc['title']}</b>
-
-                <br><br>
-
-                <a href="{doc['url']}"
-                   target="_blank">
-
-                    Open Confluence Page
-
-                </a>
-
-            </div>
-            """
-
-        html = f"""
-
-        <h3>Answer</h3>
-
-        <div style="margin-top:15px;">
-            {answer}
-        </div>
-
-        <br>
-
-        <h3>Sources</h3>
-
-        {sources_html}
-        """
-
-        return render(html)
-
-    except Exception as e:
-
-        logger.error(f"Search error: {e}")
-
-        return render(
-            """
-            <h3>Error</h3>
-
-            <div style="margin-top:15px;">
-                Internal server error
-            </div>
-            """
-        )
-
+    ans, link = answer(query, results)
