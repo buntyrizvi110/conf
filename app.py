@@ -1,3 +1,4 @@
+
 import os
 import re
 import logging
@@ -14,7 +15,10 @@ from openai import OpenAI
 # CONFIG
 # =========================================================
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s"
+)
 
 logger = logging.getLogger("confluence-rag")
 
@@ -29,24 +33,37 @@ CONFLUENCE_API_TOKEN = os.getenv("CONFLUENCE_API_TOKEN")
 if not OPENAI_API_KEY:
     raise Exception("OPENAI_API_KEY missing")
 
+if not CONFLUENCE_BASE_URL:
+    raise Exception("CONFLUENCE_BASE_URL missing")
+
+if not CONFLUENCE_USERNAME:
+    raise Exception("CONFLUENCE_USERNAME missing")
+
+if not CONFLUENCE_API_TOKEN:
+    raise Exception("CONFLUENCE_API_TOKEN missing")
+
 client = OpenAI(api_key=OPENAI_API_KEY)
 
-app = FastAPI(title="Production Confluence RAG")
+app = FastAPI(title="Enterprise Confluence RAG")
 
 # =========================================================
 # SETTINGS
 # =========================================================
 
-MAX_PAGES = 100
-CHUNK_SIZE = 350
-TOP_K = 5
+CHUNK_SIZE = 300
+CHUNK_OVERLAP = 80
+
+TOP_K = 10
 
 EMBEDDING_MODEL = "text-embedding-3-small"
+
+GPT_MODEL = "gpt-4.1-mini"
 
 STOPWORDS = {
     "the", "is", "was", "when", "where", "how",
     "a", "an", "of", "to", "in", "on", "for",
-    "and", "or", "with", "by", "at", "from"
+    "and", "or", "with", "by", "at", "from",
+    "that", "this", "are", "were"
 }
 
 # =========================================================
@@ -55,25 +72,24 @@ STOPWORDS = {
 
 documents = []
 
-# Each document:
-# {
-#   title,
-#   text,
-#   url,
-#   embedding
-# }
-
 # =========================================================
 # HELPERS
 # =========================================================
 
 def clean_html(html: str) -> str:
-    return BeautifulSoup(html, "html.parser").get_text(" ")
+
+    soup = BeautifulSoup(html, "html.parser")
+
+    text = soup.get_text(" ")
+
+    text = re.sub(r"\s+", " ", text)
+
+    return text.strip()
 
 
 def tokenize(text: str):
-    text = text.lower()
-    words = re.findall(r"\w+", text)
+
+    words = re.findall(r"\w+", text.lower())
 
     return [
         w for w in words
@@ -81,17 +97,28 @@ def tokenize(text: str):
     ]
 
 
-def chunk_text(text: str, size=CHUNK_SIZE):
+def chunk_text(
+    text: str,
+    size: int = CHUNK_SIZE,
+    overlap: int = CHUNK_OVERLAP
+):
 
     words = text.split()
 
     chunks = []
 
-    for i in range(0, len(words), size):
-        chunk = " ".join(words[i:i + size])
+    start = 0
+
+    while start < len(words):
+
+        end = start + size
+
+        chunk = " ".join(words[start:end])
 
         if len(chunk.strip()) > 100:
             chunks.append(chunk)
+
+        start += size - overlap
 
     return chunks
 
@@ -101,9 +128,15 @@ def cosine_similarity(a, b):
     a = np.array(a)
     b = np.array(b)
 
-    return np.dot(a, b) / (
-        np.linalg.norm(a) * np.linalg.norm(b)
+    denominator = (
+        np.linalg.norm(a) *
+        np.linalg.norm(b)
     )
+
+    if denominator == 0:
+        return 0
+
+    return np.dot(a, b) / denominator
 
 
 def create_embedding(text: str):
@@ -115,26 +148,29 @@ def create_embedding(text: str):
 
     return response.data[0].embedding
 
-
 # =========================================================
-# FETCH CONFLUENCE
+# CONFLUENCE INDEXER
 # =========================================================
 
 def fetch_confluence_pages():
 
-    logger.info("Fetching Confluence pages...")
+    global documents
 
-    if not CONFLUENCE_BASE_URL:
-        logger.error("CONFLUENCE_BASE_URL missing")
-        return
+    logger.info("Refreshing Confluence index...")
 
-    try:
+    new_documents = []
+
+    start = 0
+    limit = 50
+
+    while True:
 
         url = (
             f"{CONFLUENCE_BASE_URL}"
             f"/rest/api/content"
             f"?expand=body.storage"
-            f"&limit={MAX_PAGES}"
+            f"&limit={limit}"
+            f"&start={start}"
         )
 
         response = requests.get(
@@ -143,7 +179,7 @@ def fetch_confluence_pages():
                 CONFLUENCE_USERNAME,
                 CONFLUENCE_API_TOKEN
             ),
-            timeout=30
+            timeout=60
         )
 
         if response.status_code != 200:
@@ -153,64 +189,77 @@ def fetch_confluence_pages():
                 f"{response.status_code}"
             )
 
-            return
+            break
 
         data = response.json()
 
-        total_chunks = 0
+        results = data.get("results", [])
 
-        for page in data.get("results", []):
+        if not results:
+            break
+
+        for page in results:
 
             try:
 
-                page_id = page.get("id")
+                title = page.get(
+                    "title",
+                    "Untitled"
+                )
 
-                title = page.get("title", "Untitled")
+                html = (
+                    page["body"]["storage"]["value"]
+                )
 
-                body_html = page["body"]["storage"]["value"]
+                text = clean_html(html)
 
-                clean_text = clean_html(body_html)
+                if len(text) < 50:
+                    continue
+
+                relative_url = (
+                    page.get("_links", {})
+                    .get("webui", "")
+                )
 
                 page_url = (
                     f"{CONFLUENCE_BASE_URL}"
-                    f"/pages/viewpage.action?pageId={page_id}"
+                    f"{relative_url}"
                 )
 
-                chunks = chunk_text(clean_text)
+                chunks = chunk_text(text)
 
                 logger.info(
-                    f"Processing: {title} "
-                    f"({len(chunks)} chunks)"
+                    f"Indexing: {title}"
                 )
 
                 for chunk in chunks:
 
                     embedding = create_embedding(chunk)
 
-                    documents.append({
+                    new_documents.append({
+
                         "title": title,
+
                         "text": chunk,
+
                         "url": page_url,
+
                         "embedding": embedding
                     })
 
-                    total_chunks += 1
-
-            except Exception as page_error:
+            except Exception as e:
 
                 logger.error(
-                    f"Error processing page: {page_error}"
+                    f"Page processing failed: {e}"
                 )
 
-        logger.info(
-            f"Loaded {len(documents)} chunks "
-            f"from Confluence"
-        )
+        start += limit
 
-    except Exception as e:
+    documents = new_documents
 
-        logger.error(f"Confluence fetch error: {e}")
-
+    logger.info(
+        f"Loaded {len(documents)} chunks"
+    )
 
 # =========================================================
 # SEARCH
@@ -223,6 +272,8 @@ def semantic_search(query: str):
 
     query_embedding = create_embedding(query)
 
+    query_words = tokenize(query)
+
     scored_results = []
 
     for doc in documents:
@@ -232,23 +283,27 @@ def semantic_search(query: str):
             doc["embedding"]
         )
 
-        # keyword bonus
         keyword_bonus = 0
 
-        query_words = tokenize(query)
-
         title = doc["title"].lower()
+
         text = doc["text"].lower()
 
         for word in query_words:
 
             if word in title:
-                keyword_bonus += 0.10
+                keyword_bonus += 0.40
 
             if word in text:
-                keyword_bonus += 0.05
+                keyword_bonus += 0.20
 
-        final_score = similarity + keyword_bonus
+        if query.lower() in text:
+            keyword_bonus += 1.5
+
+        final_score = (
+            similarity +
+            keyword_bonus
+        )
 
         scored_results.append(
             (final_score, doc)
@@ -261,31 +316,37 @@ def semantic_search(query: str):
 
     return scored_results[:TOP_K]
 
-
 # =========================================================
-# GPT ANSWER GENERATION
+# GPT ANSWER
 # =========================================================
 
 def generate_answer(query: str, results):
 
     context = "\n\n".join([
-        f"""
-        Title: {doc['title']}
 
-        Content:
+        f"""
+        TITLE:
+        {doc['title']}
+
+        CONTENT:
         {doc['text']}
         """
+
         for score, doc in results
     ])
 
     prompt = f"""
-You are a Confluence enterprise assistant.
+You are an enterprise Confluence assistant.
 
-Answer the user's question ONLY from the provided context.
+Answer ONLY using the provided context.
 
-If the answer is not available,
-say:
-"Information not found in Confluence."
+Rules:
+
+- Give direct answers
+- Combine facts if needed
+- Do not hallucinate
+- If answer unavailable say:
+  "Information not found in Confluence."
 
 QUESTION:
 {query}
@@ -295,35 +356,40 @@ CONTEXT:
 """
 
     response = client.chat.completions.create(
-        model="gpt-4.1-mini",
+
+        model=GPT_MODEL,
+
+        temperature=0.1,
+
         messages=[
+
             {
                 "role": "system",
-                "content": "You answer using enterprise knowledge."
+                "content":
+                "You answer using enterprise knowledge."
             },
+
             {
                 "role": "user",
                 "content": prompt
             }
-        ],
-        temperature=0.2
+        ]
     )
 
     return response.choices[0].message.content
 
-
 # =========================================================
-# UI
+# HTML UI
 # =========================================================
 
-def render(answer=""):
+def render(content=""):
 
     return f"""
     <html>
 
     <head>
 
-        <title>Confluence RAG Production</title>
+        <title>Confluence RAG</title>
 
         <style>
 
@@ -333,14 +399,12 @@ def render(answer=""):
                 background: #f5f5f5;
             }}
 
-            h2 {{
-                color: #111;
-            }}
-
             input {{
-                width: 450px;
+                width: 550px;
                 padding: 12px;
                 font-size: 16px;
+                border-radius: 6px;
+                border: 1px solid #ccc;
             }}
 
             .btn {{
@@ -350,7 +414,12 @@ def render(answer=""):
                 border: none;
                 border-radius: 6px;
                 cursor: pointer;
-                font-size: 16px;
+                font-size: 15px;
+            }}
+
+            .refresh-btn {{
+                background: #111;
+                margin-left: 10px;
             }}
 
             .box {{
@@ -362,9 +431,9 @@ def render(answer=""):
             }}
 
             .source {{
-                margin-top: 15px;
-                padding-top: 10px;
+                margin-top: 20px;
                 border-top: 1px solid #ddd;
+                padding-top: 15px;
             }}
 
             a {{
@@ -389,44 +458,58 @@ def render(answer=""):
 
     <body>
 
-        <h2>Confluence RAG Final (Production)</h2>
+        <h2>
+            Emirates Group Confluence Search ( OpenAI RAG Solution )
+        </h2>
 
-        <form method="post" action="/ask">
+        <div style="display:flex; align-items:center;">
 
-            <input
-                name="query"
-                placeholder="Ask Confluence..."
-                required
-            />
+            <form method="post" action="/ask">
 
-            <button class="btn">
-                ASK
-            </button>
+                <input
+                    name="query"
+                    placeholder="Ask Confluence..."
+                    required
+                />
 
-        </form>
+                <button class="btn">
+                    ASK Confluence
+                </button>
+
+            </form>
+
+            <form method="post" action="/refresh">
+
+                <button
+                    class="btn refresh-btn"
+                    type="submit"
+                >
+                    Refresh Confluence
+                </button>
+
+            </form>
+
+        </div>
 
         <div class="box">
 
-            <b>Answer</b>
-
-            <div style="margin-top:15px;">
-                {answer}
-            </div>
+            {content}
 
         </div>
 
         <div class="footer">
+
             POC Project By :
             Syed Abbas Rizvi,
             STE,
             Skywards Emirates Airlines
+
         </div>
 
     </body>
 
     </html>
     """
-
 
 # =========================================================
 # ROUTES
@@ -435,17 +518,59 @@ def render(answer=""):
 @app.get("/", response_class=HTMLResponse)
 def home():
 
-    return render("")
+    return render()
 
 
 @app.on_event("startup")
 def startup():
 
-    logger.info("Starting Confluence RAG")
+    logger.info("Starting system...")
 
     fetch_confluence_pages()
 
     logger.info("System ready")
+
+
+@app.post("/refresh", response_class=HTMLResponse)
+def refresh_confluence():
+
+    try:
+
+        logger.info(
+            "Manual refresh started..."
+        )
+
+        fetch_confluence_pages()
+
+        logger.info(
+            "Manual refresh completed"
+        )
+
+        return render(
+            """
+            <h3>Success</h3>
+
+            <div style="margin-top:15px;">
+                Confluence refreshed successfully.
+            </div>
+            """
+        )
+
+    except Exception as e:
+
+        logger.error(
+            f"Refresh failed: {e}"
+        )
+
+        return render(
+            """
+            <h3>Error</h3>
+
+            <div style="margin-top:15px;">
+                Refresh failed.
+            </div>
+            """
+        )
 
 
 @app.post("/ask", response_class=HTMLResponse)
@@ -456,15 +581,48 @@ def ask(query: str = Form(...)):
         results = semantic_search(query)
 
         if not results:
+
             return render(
-                "Information not found in Confluence."
+                """
+                <h3>Answer</h3>
+
+                <div style="margin-top:15px;">
+                    Information not found in Confluence.
+                </div>
+                """
             )
 
-        answer = generate_answer(query, results)
+        answer = generate_answer(
+            query,
+            results
+        )
 
-        sources_html = ""
+        # =====================================================
+        # IF GPT SAYS INFORMATION NOT FOUND
+        # DO NOT SHOW SOURCES
+        # =====================================================
+
+        if "Information not found in Confluence" in answer:
+
+            html = f"""
+
+            <h3>Answer</h3>
+
+            <div style="margin-top:15px;">
+                {answer}
+            </div>
+
+            """
+
+            return render(html)
+
+        # =====================================================
+        # SHOW SOURCES ONLY WHEN VALID ANSWER EXISTS
+        # =====================================================
 
         seen = set()
+
+        sources_html = ""
 
         for score, doc in results:
 
@@ -474,6 +632,7 @@ def ask(query: str = Form(...)):
             seen.add(doc["url"])
 
             sources_html += f"""
+
             <div class="source">
 
                 <b>{doc['title']}</b>
@@ -490,8 +649,11 @@ def ask(query: str = Form(...)):
             </div>
             """
 
-        final_output = f"""
-        <div>
+        html = f"""
+
+        <h3>Answer</h3>
+
+        <div style="margin-top:15px;">
             {answer}
         </div>
 
@@ -502,19 +664,19 @@ def ask(query: str = Form(...)):
         {sources_html}
         """
 
-        return render(final_output)
+        return render(html)
 
     except Exception as e:
 
         logger.error(f"Search error: {e}")
 
         return render(
-            "Internal server error"
+            """
+            <h3>Error</h3>
+
+            <div style="margin-top:15px;">
+                Internal server error
+            </div>
+            """
         )
 
-
-# =========================================================
-# LOCAL RUN
-# =========================================================
-
-# uvicorn app:app --reload
